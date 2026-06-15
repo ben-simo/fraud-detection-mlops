@@ -1,0 +1,178 @@
+# ============================================================
+#  docker-compose.yml — Stack temps réel (VM mlflow-server)
+#
+#  7 services : MLflow, Elasticsearch, Kibana, Kafka (KRaft),
+#  Airflow, fraud-api (FastAPI), Metricbeat.
+#
+#  Prérequis :
+#    1. cp .env.example .env && nano .env
+#    2. Générer KAFKA_CLUSTER_ID (voir .env.example)
+#    3. sudo chown -R 50000:0 airflow/state airflow/logs  (UID Airflow)
+#    4. docker compose up -d
+#
+#  ⚠ Race condition au boot : fraud-api peut démarrer avant ES.
+#     Après un cold boot, attendre ~2 min puis :
+#       curl localhost:9200/_cluster/health
+#       docker restart fraud-api
+#     Attendre le log "🚀 Consumer prêt" avant toute simulation.
+# ============================================================
+version: "3.8"
+
+services:
+  # ================ MLflow ================
+  mlflow:
+    build: ./docker/mlflow
+    container_name: mlflow-server
+    hostname: mlflow-server
+    ports: ["5000:5000"]
+    environment:
+      MLFLOW_HOST: "0.0.0.0"
+    volumes:
+      - mlflow-data:/mlflow
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+    networks: [pfe-net]
+    restart: unless-stopped
+
+  # ================ Elasticsearch ================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: elasticsearch
+    hostname: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      # Mono-node : replicas=0 obligatoire
+      - index.number_of_replicas=0
+    ports: ["9200:9200"]
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    networks: [pfe-net]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ================ Kibana ================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    hostname: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports: ["5601:5601"]
+    depends_on: [elasticsearch]
+    networks: [pfe-net]
+    restart: unless-stopped
+
+  # ================ Kafka (KRaft, sans Zookeeper) ================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"   # interne (docker network)
+      - "9094:9094"   # externe (VM / Cloud Shell)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${VM_EXTERNAL_IP}:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+    networks: [pfe-net]
+    restart: unless-stopped
+
+  # ================ Airflow ================
+  airflow:
+    build: ./docker/airflow
+    container_name: airflow
+    hostname: airflow
+    user: "${AIRFLOW_UID}:0"
+    command: airflow standalone
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/state/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    ports: ["8080:8080"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-state:/opt/airflow/state
+      - airflow-logs:/opt/airflow/logs
+    networks: [pfe-net]
+    restart: unless-stopped
+
+  # ================ fraud-api (FastAPI + LightGBM) ================
+  fraud-api:
+    build: ./docker/fraud-api
+    container_name: fraud-api
+    hostname: fraud-api
+    ports: ["8000:8000"]
+    environment:
+      GCS_BUCKET: ${GCS_BUCKET}
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      ES_HOST: elasticsearch
+      ES_PORT: "9200"
+      ES_INDEX: ${ES_INDEX}
+      AIRFLOW_URL: http://airflow:8080
+      AIRFLOW_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      CHAMPION_POINTER: gs://${GCS_BUCKET}/models/current_champion.json
+      BATCH_PER_CYCLE: ${BATCH_PER_CYCLE}
+    depends_on: [kafka, elasticsearch]
+    networks: [pfe-net]
+    restart: unless-stopped
+
+  # ================ Metricbeat ================
+  metricbeat:
+    image: docker.elastic.co/beats/metricbeat:8.13.0
+    container_name: metricbeat
+    hostname: metricbeat
+    user: root
+    environment:
+      - DOCKER_API_VERSION=1.44
+    volumes:
+      - ./docker/metricbeat/metricbeat.yml:/usr/share/metricbeat/metricbeat.yml:ro
+      - /proc:/hostfs/proc:ro
+      - /sys:/hostfs/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/hostfs:ro
+    command: ["metricbeat", "-e", "--strict.perms=false",
+              "-system.hostfs=/hostfs"]
+    depends_on: [elasticsearch]
+    networks: [pfe-net]
+    restart: unless-stopped
+
+volumes:
+  esdata:
+    name: mlflow_esdata
+  mlflow-data:
+    name: mlflow_mlflow-data
+  airflow-state:
+    name: mlflow_airflow-state
+  airflow-logs:
+    name: mlflow_airflow-logs
+
+networks:
+  pfe-net:
+    name: mlflow_pfe-net
